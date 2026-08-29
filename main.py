@@ -1,204 +1,397 @@
-import os
-import sqlite3
-import subprocess
-from threading import Thread
-from flask import Flask
 import telebot
-
-# --- FLASK KEEP-ALIVE SERVER ---
+import subprocess
+import os
+import zipfile
+import tempfile
+import shutil
+from telebot import types
+import time
+from datetime import datetime, timedelta
+import psutil
+import sqlite3
+import json
+import logging
+import signal 
+import threading
+import re 
+import sys 
+import atexit
+import requests
+from flask import Flask
+from threading import Thread
 app = Flask('')
-
 @app.route('/')
 def home():
-    return "DPKHostBot Server is Running Live!"
-
+    return "Made تسح"
 def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
+  port = int(os.environ.get("PORT", 8080))
+  app.run(host='0.0.0.0', port=port)
 def keep_alive():
     t = Thread(target=run_flask)
-    t.daemon = True
+    t.daemon = True 
     t.start()
-
-# --- CONFIGURATION ---
-BOT_TOKEN = "8976542965:AAEaOjnmUgu6ulYIXkPYLimNjcIhGcPhef4"
+    print("Flask Keep-Alive server started.")
+TOKEN = '8976542965:AAHi_AgX0rEgBQ8DsvLCmiRC7zMVOaLZvao' 
+OWNER_ID = 8887398617
 ADMIN_ID = 8887398617
-UPI_ID = "deepak-91k@fam"
-PLAN_PRICE = 19
-CONTACT_HANDLE = "@DeepakTechM"
+YOUR_USERNAME = ''
+UPDATE_CHANNEL = '' 
+BASE_DIR = os.path.abspath(os.path.dirname(__file__)) 
+UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
+IROTECH_DIR = os.path.join(BASE_DIR, 'inf') 
+DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
+FREE_USER_LIMIT = 3
+SUBSCRIBED_USER_LIMIT = 15
+ADMIN_LIMIT = 999       
+OWNER_LIMIT = float('inf')
 
-bot = telebot.TeleBot(BOT_TOKEN)
+os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
+os.makedirs(IROTECH_DIR, exist_ok=True)
+bot = telebot.TeleBot(TOKEN)
 
-# --- DATABASE SETUP ---
-DATABASE_PATH = "bot_data.db"
+# --- Data structures ---
+bot_scripts = {} # Stores info about running scripts {script_key: info_dict}
+user_subscriptions = {} # {user_id: {'expiry': datetime_object}}
+user_files = {} # {user_id: [(file_name, file_type), ...]}
+active_users = set() # Set of all user IDs that have interacted with the bot
+admin_ids = {ADMIN_ID, OWNER_ID} # Set of admin IDs
+bot_locked = False
+# free_mode = False # Removed free_mode
 
+# --- Logging Setup ---
+# Configure basic logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Command Button Layouts (ReplyKeyboardMarkup) ---
+COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
+    ["📢 Updates Channel"],
+    ["📤 Upload File", "📂 Check Files"],
+    ["⚡ Bot Speed", "📊 Statistics"], # Statistics button kept for users, logic will restrict if not admin
+    ["📞 Contact Owner"]
+]
+ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
+    ["📢 Updates Channel"],
+    ["📤 Upload File", "📂 Check Files"],
+    ["⚡ Bot Speed", "📊 Statistics"],
+    ["💳 Subscriptions", "📢 Broadcast"],
+    ["🔒 Lock Bot", "🟢 Running All Code"], # Changed "Free Mode" to "Running All Code"
+    ["👑 Admin Panel", "📞 Contact Owner"]
+]
+
+# --- Database Setup ---
 def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, is_subscribed INTEGER DEFAULT 0, max_bots INTEGER DEFAULT 1)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_files 
-                 (user_id INTEGER, file_name TEXT, file_type TEXT)''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# Active running processes storage
-running_processes = {}
-user_files = {}
-
-def get_user_folder(user_id):
-    folder = f"user_{user_id}"
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    return folder
-
-def is_user_subscribed(user_id):
-    if user_id == ADMIN_ID:
-        return True
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT is_subscribed FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row and row[0] == 1
-
-def get_max_bots(user_id):
-    if user_id == ADMIN_ID:
-        return 999
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT max_bots FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 1
-
-def run_script(file_path, user_id, user_folder, file_name):
+    """Initialize the database with required tables"""
+    logger.info(f"Initializing database at: {DATABASE_PATH}")
     try:
-        if user_id in running_processes and file_name in running_processes[user_id]:
-            running_processes[user_id][file_name].terminate()
-
-        proc = subprocess.Popen(["python", file_path], cwd=user_folder)
-        if user_id not in running_processes:
-            running_processes[user_id] = {}
-        running_processes[user_id][file_name] = proc
-        bot.send_message(user_id, f"🚀 Executing `{file_name}` in background...", parse_mode="Markdown")
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False) # Allow access from multiple threads
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
+                     (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_files
+                     (user_id INTEGER, file_name TEXT, file_type TEXT,
+                      PRIMARY KEY (user_id, file_name))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS active_users
+                     (user_id INTEGER PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS admins
+                     (user_id INTEGER PRIMARY KEY)''') # Added admins table
+        # Ensure owner and initial admin are in admins table
+        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
+        if ADMIN_ID != OWNER_ID:
+             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully.")
     except Exception as e:
-        bot.send_message(user_id, f"❌ Failed to run `{file_name}`: {e}")
+        logger.error(f"❌ Database initialization error: {e}", exc_info=True)
 
-# --- BOT COMMAND HANDLERS ---
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
+def load_data():
+    """Load data from database into memory"""
+    logger.info("Loading data from database...")
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
 
-    welcome_text = (
-        f"👋 Welcome to DPK Host Bot!\n\n"
-        f"🤖 Free Plan: Host 1 bot file (Max 10MB)\n"
-        f"💎 Premium Plan (₹{PLAN_PRICE}/month): Host up to 15 bots!\n\n"
-        f"Commands:\n"
-        f"/plan - Check Subscription Status\n"
-        f"/pay - Subscribe / Upgrade\n"
-        f"/mybots - List active running bots\n"
-        f"Contact Admin: {CONTACT_HANDLE}"
-    )
-    bot.reply_to(message, welcome_text)
+        # Load subscriptions
+        c.execute('SELECT user_id, expiry FROM subscriptions')
+        for user_id, expiry in c.fetchall():
+            try:
+                user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
+            except ValueError:
+                logger.warning(f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping.")
 
-@bot.message_handler(commands=['plan'])
-def check_plan(message):
-    user_id = message.from_user.id
-    subbed = is_user_subscribed(user_id)
-    max_b = get_max_bots(user_id)
-    status = "Active Subscriber 💎" if subbed else "Free User 🆓"
-    bot.reply_to(message, f"📊 Your Status: {status}\nMax Bots Allowed: {max_b}")
+        # Load user files
+        c.execute('SELECT user_id, file_name, file_type FROM user_files')
+        for user_id, file_name, file_type in c.fetchall():
+            if user_id not in user_files:
+                user_files[user_id] = []
+            user_files[user_id].append((file_name, file_type))
 
-@bot.message_handler(commands=['pay'])
-def payment_info(message):
-    pay_text = (
-        f"💳 *Subscription Payment*\n\n"
-        f"Price: ₹{PLAN_PRICE} / Month\n"
-        f"UPI ID: `{UPI_ID}`\n\n"
-        f"Payment karne ke baad UTR/Transaction ID is tarah bhejein:\n"
-        f"`/verify <12-digit-UTR-Number>`"
-    )
-    bot.reply_to(message, pay_text, parse_mode="Markdown")
+        # Load active users
+        c.execute('SELECT user_id FROM active_users')
+        active_users.update(user_id for (user_id,) in c.fetchall())
 
-@bot.message_handler(commands=['verify'])
-def verify_utr(message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Direct format: `/verify 123456789012`", parse_mode="Markdown")
+        # Load admins
+        c.execute('SELECT user_id FROM admins')
+        admin_ids.update(user_id for (user_id,) in c.fetchall()) # Load admins into the set
+
+        conn.close()
+        logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
+    except Exception as e:
+        logger.error(f"❌ Error loading data: {e}", exc_info=True)
+
+# Initialize DB and Load Data at startup
+init_db()
+load_data()
+# --- End Database Setup ---
+
+# --- Helper Functions ---
+def get_user_folder(user_id):
+    """Get or create user's folder for storing files"""
+    user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
+    os.makedirs(user_folder, exist_ok=True)
+    return user_folder
+
+def get_user_file_limit(user_id):
+    """Get the file upload limit for a user"""
+    # if free_mode: return FREE_MODE_LIMIT # Removed free_mode check
+    if user_id == OWNER_ID: return OWNER_LIMIT
+    if user_id in admin_ids: return ADMIN_LIMIT
+    if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
+        return SUBSCRIBED_USER_LIMIT
+    return FREE_USER_LIMIT
+
+def get_user_file_count(user_id):
+    """Get the number of files uploaded by a user"""
+    return len(user_files.get(user_id, []))
+
+def is_bot_running(script_owner_id, file_name): # Parameter renamed for clarity
+    """Check if a bot script is currently running for a specific user"""
+    script_key = f"{script_owner_id}_{file_name}" # Key uses script_owner_id
+    script_info = bot_scripts.get(script_key)
+    if script_info and script_info.get('process'):
+        try:
+            proc = psutil.Process(script_info['process'].pid)
+            is_running = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+            if not is_running:
+                logger.warning(f"Process {script_info['process'].pid} for {script_key} found in memory but not running/zombie. Cleaning up.")
+                if 'log_file' in script_info and hasattr(script_info['log_file'], 'close') and not script_info['log_file'].closed:
+                    try:
+                        script_info['log_file'].close()
+                    except Exception as log_e:
+                        logger.error(f"Error closing log file during zombie cleanup {script_key}: {log_e}")
+                if script_key in bot_scripts:
+                    del bot_scripts[script_key]
+            return is_running
+        except psutil.NoSuchProcess:
+            logger.warning(f"Process for {script_key} not found (NoSuchProcess). Cleaning up.")
+            if 'log_file' in script_info and hasattr(script_info['log_file'], 'close') and not script_info['log_file'].closed:
+                try:
+                     script_info['log_file'].close()
+                except Exception as log_e:
+                     logger.error(f"Error closing log file during cleanup of non-existent process {script_key}: {log_e}")
+            if script_key in bot_scripts:
+                 del bot_scripts[script_key]
+            return False
+        except Exception as e:
+            logger.error(f"Error checking process status for {script_key}: {e}", exc_info=True)
+            return False
+    return False
+
+
+def kill_process_tree(process_info):
+    """Kill a process and all its children, ensuring log file is closed."""
+    pid = None
+    log_file_closed = False
+    script_key = process_info.get('script_key', 'N/A') 
+
+    try:
+        if 'log_file' in process_info and hasattr(process_info['log_file'], 'close') and not process_info['log_file'].closed:
+            try:
+                process_info['log_file'].close()
+                log_file_closed = True
+                logger.info(f"Closed log file for {script_key} (PID: {process_info.get('process', {}).get('pid', 'N/A')})")
+            except Exception as log_e:
+                logger.error(f"Error closing log file during kill for {script_key}: {log_e}")
+
+        process = process_info.get('process')
+        if process and hasattr(process, 'pid'):
+           pid = process.pid
+           if pid: 
+                try:
+                    parent = psutil.Process(pid)
+                    children = parent.children(recursive=True)
+                    logger.info(f"Attempting to kill process tree for {script_key} (PID: {pid}, Children: {[c.pid for c in children]})")
+
+                    for child in children:
+                        try:
+                            child.terminate()
+                            logger.info(f"Terminated child process {child.pid} for {script_key}")
+                        except psutil.NoSuchProcess:
+                            logger.warning(f"Child process {child.pid} for {script_key} already gone.")
+                        except Exception as e:
+                            logger.error(f"Error terminating child {child.pid} for {script_key}: {e}. Trying kill...")
+                            try: child.kill(); logger.info(f"Killed child process {child.pid} for {script_key}")
+                            except Exception as e2: logger.error(f"Failed to kill child {child.pid} for {script_key}: {e2}")
+
+                    gone, alive = psutil.wait_procs(children, timeout=1)
+                    for p in alive:
+                        logger.warning(f"Child process {p.pid} for {script_key} still alive. Killing.")
+                        try: p.kill()
+                        except Exception as e: logger.error(f"Failed to kill child {p.pid} for {script_key} after wait: {e}")
+
+                    try:
+                        parent.terminate()
+                        logger.info(f"Terminated parent process {pid} for {script_key}")
+                        try: parent.wait(timeout=1)
+                        except psutil.TimeoutExpired:
+                            logger.warning(f"Parent process {pid} for {script_key} did not terminate. Killing.")
+                            parent.kill()
+                            logger.info(f"Killed parent process {pid} for {script_key}")
+                    except psutil.NoSuchProcess:
+                        logger.warning(f"Parent process {pid} for {script_key} already gone.")
+                    except Exception as e:
+                        logger.error(f"Error terminating parent {pid} for {script_key}: {e}. Trying kill...")
+                        try: parent.kill(); logger.info(f"Killed parent process {pid} for {script_key}")
+                        except Exception as e2: logger.error(f"Failed to kill parent {pid} for {script_key}: {e2}")
+
+                except psutil.NoSuchProcess:
+                    logger.warning(f"Process {pid or 'N/A'} for {script_key} not found during kill. Already terminated?")
+           else: logger.error(f"Process PID is None for {script_key}.")
+        elif log_file_closed: logger.warning(f"Process object missing for {script_key}, but log file closed.")
+        else: logger.error(f"Process object missing for {script_key}, and no log file. Cannot kill.")
+    except Exception as e:
+        logger.error(f"❌ Unexpected error killing process tree for PID {pid or 'N/A'} ({script_key}): {e}", exc_info=True)
+
+# --- Automatic Package Installation & Script Running ---
+
+def attempt_install_pip(module_name, message):
+    package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name) 
+    if package_name is None: 
+        logger.info(f"Module '{module_name}' is core. Skipping pip install.")
+        return False 
+    try:
+        bot.reply_to(message, f"🐍 Module `{module_name}` not found. Installing `{package_name}`...", parse_mode='Markdown')
+        command = [sys.executable, '-m', 'pip', 'install', package_name]
+        logger.info(f"Running install: {' '.join(command)}")
+        result = subprocess.run(command, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore')
+        if result.returncode == 0:
+            logger.info(f"Installed {package_name}. Output:\n{result.stdout}")
+            bot.reply_to(message, f"✅ Package `{package_name}` (for `{module_name}`) installed.", parse_mode='Markdown')
+            return True
+        else:
+            error_msg = f"❌ Failed to install `{package_name}` for `{module_name}`.\nLog:\n```\n{result.stderr or result.stdout}\n```"
+            logger.error(error_msg)
+            if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
+            bot.reply_to(message, error_msg, parse_mode='Markdown')
+            return False
+    except Exception as e:
+        error_msg = f"❌ Error installing `{package_name}`: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        bot.reply_to(message, error_msg)
+        return False
+
+def attempt_install_npm(module_name, user_folder, message):
+    try:
+        bot.reply_to(message, f"🟠 Node package `{module_name}` not found. Installing locally...", parse_mode='Markdown')
+        command = ['npm', 'install', module_name]
+        logger.info(f"Running npm install: {' '.join(command)} in {user_folder}")
+        result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=user_folder, encoding='utf-8', errors='ignore')
+        if result.returncode == 0:
+            logger.info(f"Installed {module_name}. Output:\n{result.stdout}")
+            bot.reply_to(message, f"✅ Node package `{module_name}` installed locally.", parse_mode='Markdown')
+            return True
+        else:
+            error_msg = f"❌ Failed to install Node package `{module_name}`.\nLog:\n```\n{result.stderr or result.stdout}\n```"
+            logger.error(error_msg)
+            if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
+            bot.reply_to(message, error_msg, parse_mode='Markdown')
+            return False
+    except FileNotFoundError:
+         error_msg = "❌ Error: 'npm' not found. Ensure Node.js/npm are installed and in PATH."
+         logger.error(error_msg)
+         bot.reply_to(message, error_msg)
+         return False
+    except Exception as e:
+        error_msg = f"❌ Error installing Node package `{module_name}`: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        bot.reply_to(message, error_msg)
+        return False
+
+def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
+    """Run Python script. script_owner_id is used for the script_key. message_obj_for_reply is for sending feedback."""
+    max_attempts = 2 
+    if attempt > max_attempts:
+        bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
         return
-    
-    utr = args[1]
-    bot.reply_to(message, f"⏳ UTR `{utr}` sent to Admin for verification. Please wait!", parse_mode="Markdown")
-    
-    admin_msg = (
-        f"🔔 *New Payment Request*\n\n"
-        f"User ID: `{user_id}`\n"
-        f"UTR: `{utr}`\n\n"
-        f"Approve karne ke liye command bhejein:\n"
-        f"`/approve {user_id}`"
-    )
-    bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
 
-@bot.message_handler(commands=['approve'])
-def approve_user(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: `/approve <user_id>`")
-        return
-    
-    target_id = int(args[1])
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_subscribed = 1, max_bots = 15 WHERE user_id = ?", (target_id,))
-    conn.commit()
-    conn.close()
+    script_key = f"{script_owner_id}_{file_name}"
+    logger.info(f"Attempt {attempt} to run Python script: {script_path} (Key: {script_key}) for user {script_owner_id}")
 
-    bot.reply_to(message, f"✅ Approved User `{target_id}` successfully!")
-    bot.send_message(target_id, "🎉 Your subscription is active now! You can host up to 15 bots.")
+    try:
+        if not os.path.exists(script_path):
+             bot.reply_to(message_obj_for_reply, f"❌ Error: Script '{file_name}' not found at '{script_path}'!")
+             logger.error(f"Script not found: {script_path} for user {script_owner_id}")
+             if script_owner_id in user_files:
+                 user_files[script_owner_id] = [f for f in user_files.get(script_owner_id, []) if f[0] != file_name]
+             remove_user_file_db(script_owner_id, file_name)
+             return
 
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    user_id = message.from_user.id
-    file_name = message.document.file_name
-    file_size = message.document.file_size
+        if attempt == 1:
+            check_command = [sys.executable, script_path]
+            logger.info(f"Running Python pre-check: {' '.join(check_command)}")
+            check_proc = None
+            try:
+                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
+                stdout, stderr = check_proc.communicate(timeout=5)
+                return_code = check_proc.returncode
+                logger.info(f"Python Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
+                if return_code != 0 and stderr:
+                    match_py = re.search(r"ModuleNotFoundError: No module named '(.+?)'", stderr)
+                    if match_py:
+                        module_name = match_py.group(1).strip().strip("'\"")
+                        logger.info(f"Detected missing Python module: {module_name}")
+                        if attempt_install_pip(module_name, message_obj_for_reply):
+                            logger.info(f"Install OK for {module_name}. Retrying run_script...")
+                            bot.reply_to(message_obj_for_reply, f"🔄 Install successful. Retrying '{file_name}'...")
+                            time.sleep(2)
+                            threading.Thread(target=run_script, args=(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt + 1)).start()
+                            return
+                        else:
+                            bot.reply_to(message_obj_for_reply, f"❌ Install failed. Cannot run '{file_name}'.")
+                            return
+                    else:
+                         error_summary = stderr[:500]
+                         bot.reply_to(message_obj_for_reply, f"❌ Error in script pre-check for '{file_name}':\n```\n{error_summary}\n```\nFix the script.", parse_mode='Markdown')
+                         return
+            except subprocess.TimeoutExpired:
+                logger.info("Python Pre-check timed out (>5s), imports likely OK. Killing check process.")
+                if check_proc and check_proc.poll() is None: check_proc.kill(); check_proc.communicate()
+                logger.info("Python Check process killed. Proceeding to long run.")
+            except FileNotFoundError:
+                 logger.error(f"Python interpreter not found: {sys.executable}")
+                 bot.reply_to(message_obj_for_reply, f"❌ Error: Python interpreter '{sys.executable}' not found.")
+                 return
+            except Exception as e:
+                 logger.error(f"Error in Python pre-check for {script_key}: {e}", exc_info=True)
+                 bot.reply_to(message_obj_for_reply, f"❌ Unexpected error in script pre-check for '{file_name}': {e}")
+                 return
+            finally:
+                 if check_proc and check_proc.poll() is None:
+                     logger.warning(f"Python Check process {check_proc.pid} still running. Killing.")
+                     check_proc.kill(); check_proc.communicate()
 
-    if file_size > 10 * 1024 * 1024:
-        bot.reply_to(message, "❌ File size exceeds 10MB limit.")
-        return
-
-    max_b = get_max_bots(user_id)
-    user_folder = get_user_folder(user_id)
-    
-    existing_files = [f for f in os.listdir(user_folder) if os.path.isfile(os.path.join(user_folder, f))]
-    if file_name not in existing_files and len(existing_files) >= max_b:
-        bot.reply_to(message, f"❌ Plan limit reached! Max bots allowed: {max_b}. Upgrade with /pay.")
-        return
-
-    file_info = bot.get_file(message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-
-    file_path = os.path.join(user_folder, file_name)
-    with open(file_path, 'wb') as new_file:
-        new_file.write(downloaded_file)
-
-    bot.reply_to(message, f"✅ Saved `{file_name}` successfully!", parse_mode="Markdown")
-
-    if file_name.endswith('.py'):
-        run_script(file_path, user_id, user_folder, file_name)
-
-if __name__ == '__main__':
-    keep_alive()
-    print("Bot starting...")
-    bot.infinity_polling()
-  
+        logger.info(f"Starting long-running Python process for {script_key}")
+        log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
+        log_file = None; process = None
+        try: log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
+        except Exception as e:
+             logger.error(f"Failed to open log file '{log_file_path}' for {script_key}: {e}", exc_info=True)
+             bot.reply_to(message_obj_for_reply, f"❌ Failed to open log file '{log_file_path}': {e}")
+             return
+        try:
+            startupinfo = None; creationflags = 0
+            if os.name == 'nt':
+                 startupinfo = subprocess.STARTUPINFO(); startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                 startup
