@@ -21,10 +21,10 @@ def keep_alive():
     t.start()
 
 # --- CONFIGURATION ---
-BOT_TOKEN = "8976542965:AAHi_AgX0rEgBQ8DsvLCmiRC7zMVOaLZvao"
+BOT_TOKEN = "8976542965:AAEaOjnmUgu6ulYIXkPYLimNjcIhGcPhef4"
 ADMIN_ID = 8887398617
 UPI_ID = "deepak-91k@fam"
-PLAN_PRICE = 49
+PLAN_PRICE = 19
 CONTACT_HANDLE = "@DeepakTechM"
 
 bot = telebot.TeleBot(BOT_TOKEN)
