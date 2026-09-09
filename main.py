@@ -31,7 +31,7 @@ def keep_alive():
     t.daemon = True 
     t.start()
     print("Flask Keep-Alive server started.")
-BOT_TOKEN = "8976542965:AAEaOjnmUgu6ulYIXkPYLimNjcIhGcPhef4"
+TOKEN = '8976542965:AAFRuB8B-CQSxpsVabJ0NqnyjM7_KvAO6uI' 
 OWNER_ID = 8887398617
 ADMIN_ID = 8887398617
 YOUR_USERNAME = ''
