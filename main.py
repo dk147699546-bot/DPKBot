@@ -870,43 +870,39 @@ def create_subscription_menu():
 # --- File Handling ---
 def is_entry_point_script(file_name, file_path, file_type):
     """Detect if a script is an entry-point (runnable bot/app), not a helper module.
-    This ensures that when a ZIP contains multiple bots (e.g. bot1.py + bot2.py),
-    ALL of them are started, not just one 'main' file."""
-    # Always-skip helper/module files
+    VERY LENIENT: only skip truly non-runnable files. Anything that looks like a
+    real bot/app script (any size, any line count, with or without __main__) is
+    accepted. This means a ZIP with N .py/.js files will start ALL N scripts.
+
+    Skipped (definitely NOT entry points):
+      - Python package markers: __init__.py
+      - Build/packaging: setup.py, conftest.py
+      - Django/Flask internals: settings.py, wsgi.py, asgi.py, urls.py, celery.py
+      - Migrations: migrations/*.py
+      - Test files: test_*.py, *_test.py, tests.py
+    Everything else (.py with content, all .js) → ENTRY POINT."""
+    name_lower = file_name.lower()
+
+    # Definitely non-runnable
     skip_files = {'__init__.py', 'setup.py', 'conftest.py', 'manage.py',
                   'wsgi.py', 'asgi.py', 'settings.py', 'celery.py',
-                  'config.py', 'database.py', 'db.py', 'utils.py', 'helpers.py',
-                  'models.py', 'schemas.py', 'serializers.py', 'routes.py'}
-    if file_name in skip_files:
+                  'urls.py', 'admin.py', 'apps.py', 'tests.py', 'tasks.py'}
+    if name_lower in skip_files:
         return False
-    # Skip test files
-    if file_name.startswith('test_') or file_name.endswith('_test.py') or file_name.startswith('tests_'):
+    # Migration files like 0001_initial.py
+    if name_lower.startswith('__') and name_lower.endswith('.py'):
         return False
-    # For Python, inspect content for entry-point / bot indicators
-    if file_type == 'py' and os.path.exists(file_path):
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            # Strong signal: has __main__ guard
-            if "__name__" in content and "__main__" in content:
-                return True
-            # Strong signal: looks like a Telegram/long-running bot
-            bot_indicators = ['telebot', 'telegram', 'pyrogram', 'telethon', 'aiogram',
-                              'bot.polling', 'bot.infinity_polling', 'app.run(',
-                              'client.run(', 'application.run(', 'updater.start_polling',
-                              'dispatcher.start_polling', 'polling()', 'run_polling(']
-            if any(ind in content for ind in bot_indicators):
-                return True
-            # Small files without main/bot markers are likely helper modules
-            line_count = content.count('\n') + 1
-            if line_count < 30:
-                return False
-            # Larger files without clear signals: treat as entry point (user can stop if not needed)
-            return True
-        except Exception as e:
-            logger.warning(f"Could not read {file_name} for entry-point check: {e}. Assuming entry point.")
-            return True
-    # JS files: assume all are entry points (no __main__ convention)
+    # Test files
+    if name_lower.startswith('test_') or name_lower.endswith('_test.py') \
+       or name_lower.startswith('tests_') or name_lower == 'tests.py':
+        return False
+    # Numbered migrations: 0001_initial.py, 0002_auto.py etc.
+    base = name_lower.rsplit('.', 1)[0]
+    if base and base[0].isdigit() and '_' in base:
+        return False
+
+    # Everything else is treated as an entry point — no line-count or size limit,
+    # no requirement of __main__ guard. User wants unlimited (15000+ lines OK).
     return True
 
 
@@ -928,23 +924,41 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
             zip_ref.extractall(temp_dir)
             logger.info(f"Extracted zip to {temp_dir}")
 
-        extracted_items = os.listdir(temp_dir)
-        py_files = [f for f in extracted_items if f.endswith('.py')]
-        js_files = [f for f in extracted_items if f.endswith('.js')]
-        req_file = 'requirements.txt' if 'requirements.txt' in extracted_items else None
-        pkg_json = 'package.json' if 'package.json' in extracted_items else None
+        # Scan recursively so scripts in subfolders (e.g. src/main.py, bot/app.py)
+        # are also detected. Walk the whole extracted tree.
+        all_py_files = []   # list of relative paths from temp_dir, e.g. "src/bot.py"
+        all_js_files = []
+        req_file_rel = None
+        pkg_json_rel = None
+        for root, dirs, files in os.walk(temp_dir):
+            # Skip __pycache__, .git, node_modules, venv
+            dirs[:] = [d for d in dirs if d not in ('__pycache__', '.git', 'node_modules', '.venv', 'venv', 'env')]
+            for fn in files:
+                rel = os.path.relpath(os.path.join(root, fn), temp_dir)
+                if fn.lower().endswith('.py'):
+                    all_py_files.append(rel)
+                elif fn.lower().endswith('.js'):
+                    all_js_files.append(rel)
+                elif fn.lower() == 'requirements.txt' and req_file_rel is None:
+                    req_file_rel = rel
+                elif fn.lower() == 'package.json' and pkg_json_rel is None:
+                    pkg_json_rel = rel
 
-        if req_file:
-            req_path = os.path.join(temp_dir, req_file)
+        # For backward-compat with the requirements/package install block below,
+        # we keep only relative-path lists (all_py_files / all_js_files).
+        # Top-level basenames list no longer needed since we walk recursively.
+
+        if req_file_rel:
+            req_path = os.path.join(temp_dir, req_file_rel)
             logger.info(f"requirements.txt found, installing: {req_path}")
-            bot.reply_to(message, f"🔄 Installing Python deps from `{req_file}`...")
+            bot.reply_to(message, f"🔄 Installing Python deps from `{req_file_rel}`...")
             try:
                 command = [sys.executable, '-m', 'pip', 'install', '-r', req_path]
                 result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
                 logger.info(f"pip install from requirements.txt OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Python deps from `{req_file}` installed.")
+                bot.reply_to(message, f"✅ Python deps from `{req_file_rel}` installed.")
             except subprocess.CalledProcessError as e:
-                error_msg = f"❌ Failed to install Python deps from `{req_file}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
+                error_msg = f"❌ Failed to install Python deps from `{req_file_rel}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
                 logger.error(error_msg)
                 if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
                 bot.reply_to(message, error_msg, parse_mode='Markdown'); return
@@ -952,18 +966,19 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                  error_msg = f"❌ Unexpected error installing Python deps: {e}"
                  logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
 
-        if pkg_json:
-            logger.info(f"package.json found, npm install in: {temp_dir}")
-            bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json}`...")
+        if pkg_json_rel:
+            pkg_json_dir = os.path.dirname(os.path.join(temp_dir, pkg_json_rel))
+            logger.info(f"package.json found, npm install in: {pkg_json_dir}")
+            bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json_rel}`...")
             try:
                 command = ['npm', 'install']
-                result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=temp_dir, encoding='utf-8', errors='ignore')
+                result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=pkg_json_dir, encoding='utf-8', errors='ignore')
                 logger.info(f"npm install OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Node deps from `{pkg_json}` installed.")
+                bot.reply_to(message, f"✅ Node deps from `{pkg_json_rel}` installed.")
             except FileNotFoundError:
                 bot.reply_to(message, "❌ 'npm' not found. Cannot install Node deps."); return 
             except subprocess.CalledProcessError as e:
-                error_msg = f"❌ Failed to install Node deps from `{pkg_json}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
+                error_msg = f"❌ Failed to install Node deps from `{pkg_json_rel}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
                 logger.error(error_msg)
                 if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
                 bot.reply_to(message, error_msg, parse_mode='Markdown'); return
@@ -972,18 +987,22 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                  logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
 
         # Identify ALL entry-point scripts in the archive (not just one "main").
-        # This fixes the bug where the second/third bot in a ZIP never started.
-        entry_scripts = []  # list of (file_name, file_type)
-        for f in py_files:
-            f_path_temp = os.path.join(temp_dir, f)
-            if is_entry_point_script(f, f_path_temp, 'py'):
-                entry_scripts.append((f, 'py'))
-        for f in js_files:
-            f_path_temp = os.path.join(temp_dir, f)
-            if is_entry_point_script(f, f_path_temp, 'js'):
-                entry_scripts.append((f, 'js'))
+        # Uses RELATIVE paths so scripts in subfolders (src/bot.py) are tracked
+        # distinctly from top-level ones (bot.py).
+        # entry_scripts: list of (rel_path, file_type)  e.g. ("src/bot.py", "py")
+        entry_scripts = []
+        for rel in all_py_files:
+            base_name = os.path.basename(rel)
+            f_path_temp = os.path.join(temp_dir, rel)
+            if is_entry_point_script(base_name, f_path_temp, 'py'):
+                entry_scripts.append((rel, 'py'))
+        for rel in all_js_files:
+            base_name = os.path.basename(rel)
+            f_path_temp = os.path.join(temp_dir, rel)
+            if is_entry_point_script(base_name, f_path_temp, 'js'):
+                entry_scripts.append((rel, 'js'))
 
-        # De-duplicate while preserving order
+        # De-duplicate by relative path while preserving order
         seen = set()
         unique_scripts = []
         for s in entry_scripts:
@@ -992,8 +1011,24 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                 unique_scripts.append(s)
         entry_scripts = unique_scripts
 
+        # FALLBACK: if lenient check still rejected everything, accept ALL .py/.js
+        # files (no filtering). User wants unlimited — never leave them with no
+        # runnable script if the archive has any code at all.
         if not entry_scripts:
-            bot.reply_to(message, "❌ No executable `.py` or `.js` entry-point scripts found in archive!")
+            logger.warning(f"Lenient entry-point check found nothing for {user_id}. Falling back to ALL .py/.js files.")
+            for rel in all_py_files:
+                entry_scripts.append((rel, 'py'))
+            for rel in all_js_files:
+                entry_scripts.append((rel, 'js'))
+            # dedupe again
+            seen2 = set(); uniq2 = []
+            for s in entry_scripts:
+                if s[0] not in seen2:
+                    seen2.add(s[0]); uniq2.append(s)
+            entry_scripts = uniq2
+
+        if not entry_scripts:
+            bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!")
             return
 
         # Check user's file limit against ALL scripts that will be started
@@ -1009,32 +1044,53 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                     parse_mode='Markdown')
                 return
 
-        logger.info(f"Moving extracted files from {temp_dir} to {user_folder}")
+        # Move ALL extracted items (preserving folder structure) into user_folder.
+        # Uses copytree-style merge so subfolders (src/, lib/, etc.) are kept intact
+        # and scripts that import from those subfolders keep working.
+        logger.info(f"Merging extracted files from {temp_dir} to {user_folder}")
         moved_count = 0
         for item_name in os.listdir(temp_dir):
             src_path = os.path.join(temp_dir, item_name)
             dest_path = os.path.join(user_folder, item_name)
-            if os.path.isdir(dest_path): shutil.rmtree(dest_path)
-            elif os.path.exists(dest_path): os.remove(dest_path)
-            shutil.move(src_path, dest_path); moved_count +=1
-        logger.info(f"Moved {moved_count} items to {user_folder}")
+            if os.path.isdir(dest_path):
+                # Merge directories instead of replacing, so we don't wipe
+                # previously uploaded subfolders. Copy contents recursively.
+                for sub_root, _, sub_files in os.walk(src_path):
+                    rel_sub = os.path.relpath(sub_root, src_path)
+                    target_dir = os.path.join(dest_path, rel_sub) if rel_sub != '.' else dest_path
+                    os.makedirs(target_dir, exist_ok=True)
+                    for sf in sub_files:
+                        s_src = os.path.join(sub_root, sf)
+                        s_dst = os.path.join(target_dir, sf)
+                        if os.path.exists(s_dst): os.remove(s_dst)
+                        shutil.move(s_src, s_dst); moved_count += 1
+            elif os.path.exists(dest_path):
+                os.remove(dest_path)
+                shutil.move(src_path, dest_path); moved_count += 1
+            else:
+                shutil.move(src_path, dest_path); moved_count += 1
+        logger.info(f"Merged {moved_count} items into {user_folder}")
 
-        # Start ALL entry-point scripts
-        script_list_str = ", ".join(f"`{s[0]}`" for s in entry_scripts)
+        # Start ALL entry-point scripts. Each script is saved with its RELATIVE
+        # path as the file_name (e.g. "src/bot.py") so the script_key stays unique
+        # even when multiple scripts share a basename in different folders.
+        script_list_str = ", ".join(f"`{s[0]}`" for s in entry_scripts[:20])
+        if len(entry_scripts) > 20:
+            script_list_str += f", ... (+{len(entry_scripts) - 20} more)"
         bot.reply_to(message,
             f"✅ Files extracted.\n🚀 Starting *{len(entry_scripts)}* script(s): {script_list_str}",
             parse_mode='Markdown')
 
         started = 0
-        for script_name, script_type in entry_scripts:
-            save_user_file(user_id, script_name, script_type)
-            script_path = os.path.join(user_folder, script_name)
-            logger.info(f"Starting script '{script_name}' ({script_type}) for user {user_id} from zip.")
-            # Use user_id as script_owner_id for script key context
+        for script_rel, script_type in entry_scripts:
+            save_user_file(user_id, script_rel, script_type)
+            script_path = os.path.join(user_folder, script_rel)
+            # Run with cwd = user_folder so relative imports from subfolders work
+            logger.info(f"Starting script '{script_rel}' ({script_type}) for user {user_id} from zip.")
             if script_type == 'py':
-                threading.Thread(target=run_script, args=(script_path, user_id, user_folder, script_name, message)).start()
+                threading.Thread(target=run_script, args=(script_path, user_id, user_folder, script_rel, message)).start()
             elif script_type == 'js':
-                threading.Thread(target=run_js_script, args=(script_path, user_id, user_folder, script_name, message)).start()
+                threading.Thread(target=run_js_script, args=(script_path, user_id, user_folder, script_rel, message)).start()
             started += 1
             # Stagger starts to reduce CPU/RAM load spikes when ZIP has many scripts
             time.sleep(1.0)
