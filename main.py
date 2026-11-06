@@ -338,9 +338,16 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
              remove_user_file_db(script_owner_id, file_name)
              return
 
-        if attempt == 1:
+        # Size-based skip: for large scripts (>=300KB, i.e. ~10000+ lines) the 5s
+        # pre-check would just time out and force a wasteful double-startup. Go
+        # straight to long-run instead. requirements.txt is still respected.
+        SKIP_PRECHECK_BYTES = 300 * 1024
+        script_size_bytes = os.path.getsize(script_path)
+        do_precheck = (attempt == 1 and script_size_bytes < SKIP_PRECHECK_BYTES)
+
+        if do_precheck:
             check_command = [sys.executable, script_path]
-            logger.info(f"Running Python pre-check: {' '.join(check_command)}")
+            logger.info(f"Running Python pre-check: {' '.join(check_command)} (size={script_size_bytes}B)")
             check_proc = None
             try:
                 check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
@@ -381,6 +388,8 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                  if check_proc and check_proc.poll() is None:
                      logger.warning(f"Python Check process {check_proc.pid} still running. Killing.")
                      check_proc.kill(); check_proc.communicate()
+        else:
+            logger.info(f"Skipping Python pre-check for '{file_name}' (size={script_size_bytes}B >= {SKIP_PRECHECK_BYTES}B). Going straight to long-run to avoid double-startup load.")
 
         logger.info(f"Starting long-running Python process for {script_key}")
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
@@ -450,9 +459,15 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
              remove_user_file_db(script_owner_id, file_name)
              return
 
-        if attempt == 1:
+        # Size-based skip: for large JS scripts (>=300KB) skip the 5s pre-check
+        # to avoid wasteful double-startup. package.json deps are still respected.
+        SKIP_PRECHECK_BYTES_JS = 300 * 1024
+        script_size_bytes_js = os.path.getsize(script_path)
+        do_precheck_js = (attempt == 1 and script_size_bytes_js < SKIP_PRECHECK_BYTES_JS)
+
+        if do_precheck_js:
             check_command = ['node', script_path]
-            logger.info(f"Running JS pre-check: {' '.join(check_command)}")
+            logger.info(f"Running JS pre-check: {' '.join(check_command)} (size={script_size_bytes_js}B)")
             check_proc = None
             try:
                 check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
@@ -495,6 +510,8 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
                  if check_proc and check_proc.poll() is None:
                      logger.warning(f"JS Check process {check_proc.pid} still running. Killing.")
                      check_proc.kill(); check_proc.communicate()
+        else:
+            logger.info(f"Skipping JS pre-check for '{file_name}' (size={script_size_bytes_js}B >= {SKIP_PRECHECK_BYTES_JS}B). Going straight to long-run to avoid double-startup load.")
 
         logger.info(f"Starting long-running JS process for {script_key}")
         log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
@@ -851,11 +868,53 @@ def create_subscription_menu():
 # --- End Menu Creation ---
 
 # --- File Handling ---
+def is_entry_point_script(file_name, file_path, file_type):
+    """Detect if a script is an entry-point (runnable bot/app), not a helper module.
+    This ensures that when a ZIP contains multiple bots (e.g. bot1.py + bot2.py),
+    ALL of them are started, not just one 'main' file."""
+    # Always-skip helper/module files
+    skip_files = {'__init__.py', 'setup.py', 'conftest.py', 'manage.py',
+                  'wsgi.py', 'asgi.py', 'settings.py', 'celery.py',
+                  'config.py', 'database.py', 'db.py', 'utils.py', 'helpers.py',
+                  'models.py', 'schemas.py', 'serializers.py', 'routes.py'}
+    if file_name in skip_files:
+        return False
+    # Skip test files
+    if file_name.startswith('test_') or file_name.endswith('_test.py') or file_name.startswith('tests_'):
+        return False
+    # For Python, inspect content for entry-point / bot indicators
+    if file_type == 'py' and os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            # Strong signal: has __main__ guard
+            if "__name__" in content and "__main__" in content:
+                return True
+            # Strong signal: looks like a Telegram/long-running bot
+            bot_indicators = ['telebot', 'telegram', 'pyrogram', 'telethon', 'aiogram',
+                              'bot.polling', 'bot.infinity_polling', 'app.run(',
+                              'client.run(', 'application.run(', 'updater.start_polling',
+                              'dispatcher.start_polling', 'polling()', 'run_polling(']
+            if any(ind in content for ind in bot_indicators):
+                return True
+            # Small files without main/bot markers are likely helper modules
+            line_count = content.count('\n') + 1
+            if line_count < 30:
+                return False
+            # Larger files without clear signals: treat as entry point (user can stop if not needed)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not read {file_name} for entry-point check: {e}. Assuming entry point.")
+            return True
+    # JS files: assume all are entry points (no __main__ convention)
+    return True
+
+
 def handle_zip_file(downloaded_file_content, file_name_zip, message):
     user_id = message.from_user.id
     # chat_id = message.chat.id # script_owner_id (user_id here) will be used for script key context
     user_folder = get_user_folder(user_id)
-    temp_dir = None 
+    temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_zip_")
         logger.info(f"Temp dir for zip: {temp_dir}")
@@ -912,18 +971,43 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
                  error_msg = f"❌ Unexpected error installing Node deps: {e}"
                  logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
 
-        main_script_name = None; file_type = None
-        preferred_py = ['main.py', 'bot.py', 'app.py']; preferred_js = ['index.js', 'main.js', 'bot.js', 'app.js']
-        for p in preferred_py:
-            if p in py_files: main_script_name = p; file_type = 'py'; break
-        if not main_script_name:
-             for p in preferred_js:
-                 if p in js_files: main_script_name = p; file_type = 'js'; break
-        if not main_script_name:
-            if py_files: main_script_name = py_files[0]; file_type = 'py'
-            elif js_files: main_script_name = js_files[0]; file_type = 'js'
-        if not main_script_name:
-            bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!"); return
+        # Identify ALL entry-point scripts in the archive (not just one "main").
+        # This fixes the bug where the second/third bot in a ZIP never started.
+        entry_scripts = []  # list of (file_name, file_type)
+        for f in py_files:
+            f_path_temp = os.path.join(temp_dir, f)
+            if is_entry_point_script(f, f_path_temp, 'py'):
+                entry_scripts.append((f, 'py'))
+        for f in js_files:
+            f_path_temp = os.path.join(temp_dir, f)
+            if is_entry_point_script(f, f_path_temp, 'js'):
+                entry_scripts.append((f, 'js'))
+
+        # De-duplicate while preserving order
+        seen = set()
+        unique_scripts = []
+        for s in entry_scripts:
+            if s[0] not in seen:
+                seen.add(s[0])
+                unique_scripts.append(s)
+        entry_scripts = unique_scripts
+
+        if not entry_scripts:
+            bot.reply_to(message, "❌ No executable `.py` or `.js` entry-point scripts found in archive!")
+            return
+
+        # Check user's file limit against ALL scripts that will be started
+        file_limit = get_user_file_limit(user_id)
+        current_files = get_user_file_count(user_id)
+        if file_limit != float('inf'):
+            slots_available = file_limit - current_files
+            if len(entry_scripts) > slots_available:
+                bot.reply_to(message,
+                    f"⚠️ ZIP contains *{len(entry_scripts)}* script(s) but your file limit is *{file_limit}* "
+                    f"(used: {current_files}, available: {slots_available}).\n"
+                    f"Delete existing files or upload a smaller ZIP.",
+                    parse_mode='Markdown')
+                return
 
         logger.info(f"Moving extracted files from {temp_dir} to {user_folder}")
         moved_count = 0
@@ -935,16 +1019,30 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
             shutil.move(src_path, dest_path); moved_count +=1
         logger.info(f"Moved {moved_count} items to {user_folder}")
 
-        save_user_file(user_id, main_script_name, file_type)
-        logger.info(f"Saved main script '{main_script_name}' ({file_type}) for {user_id} from zip.")
-        main_script_path = os.path.join(user_folder, main_script_name)
-        bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
+        # Start ALL entry-point scripts
+        script_list_str = ", ".join(f"`{s[0]}`" for s in entry_scripts)
+        bot.reply_to(message,
+            f"✅ Files extracted.\n🚀 Starting *{len(entry_scripts)}* script(s): {script_list_str}",
+            parse_mode='Markdown')
 
-        # Use user_id as script_owner_id for script key context
-        if file_type == 'py':
-             threading.Thread(target=run_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
-        elif file_type == 'js':
-             threading.Thread(target=run_js_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
+        started = 0
+        for script_name, script_type in entry_scripts:
+            save_user_file(user_id, script_name, script_type)
+            script_path = os.path.join(user_folder, script_name)
+            logger.info(f"Starting script '{script_name}' ({script_type}) for user {user_id} from zip.")
+            # Use user_id as script_owner_id for script key context
+            if script_type == 'py':
+                threading.Thread(target=run_script, args=(script_path, user_id, user_folder, script_name, message)).start()
+            elif script_type == 'js':
+                threading.Thread(target=run_js_script, args=(script_path, user_id, user_folder, script_name, message)).start()
+            started += 1
+            # Stagger starts to reduce CPU/RAM load spikes when ZIP has many scripts
+            time.sleep(1.0)
+
+        bot.reply_to(message,
+            f"✅ Queued *{started}* script(s) for execution.\n"
+            f"📂 Use *Check Files* to monitor each one's status (Start/Stop/Logs).",
+            parse_mode='Markdown')
 
     except zipfile.BadZipFile as e:
         logger.error(f"Bad zip file from {user_id}: {e}")
